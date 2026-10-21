@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from urllib.parse import parse_qs, unquote, urlsplit
 
 VERSION = "0.1.0"
@@ -381,6 +382,11 @@ def new_request(url, source, port, bind_addr, kind="open"):
 def dispatch(req, target, wait):
     """Hand a request to an agent. Caller holds cv. Returns an HTTP status code."""
     agent = choose_agent(target)
+    if not agent and config.get("ntfy") and target in (None, PHONE):
+        req["agent"] = PHONE
+        log_event(req, "sending to phone")
+        threading.Thread(target=notify_phone, args=(req,), daemon=True).start()
+        return await_pickup(req, wait)
     if not agent:
         finish(req, "no_agent", "no agent connected" + (" named %s" % target if target else ""))
         return 503
@@ -408,17 +414,92 @@ def dispatch(req, target, wait):
     agent["queue"].append(job)
     log_event(req, "queued for %s" % agent["name"])
     cv.notify_all()
+
+    def cancel():
+        if job in agent["queue"]:
+            agent["queue"].remove(job)
+
+    return await_pickup(req, wait, cancel)
+
+
+def await_pickup(req, wait, cancel=None):
+    """Wait until the request leaves "queued". Caller holds cv. Returns an HTTP status code."""
     if not wait:
         return 202
     deadline = now() + ACK_WAIT
     while req["status"] == "queued" and now() < deadline:
         cv.wait(deadline - now())
     if req["status"] == "queued":
-        if job in agent["queue"]:
-            agent["queue"].remove(job)
-        finish(req, "failed", "%s did not pick up the request" % agent["name"])
+        if cancel:
+            cancel()
+        finish(req, "failed", "%s did not pick up the request" % req["agent"])
         return 504
     return 200 if req["status"] not in ("failed", "no_agent") else 502
+
+
+# ---------------------------------------------------------------- phone
+# A phone cannot listen on its own localhost, so it cannot take an agent's place. The hub
+# sends the URL as an ntfy push instead. After the login, the browser fails to load the
+# redirect to localhost:<port>; the user rewrites it to /finish/<port>/... on the hub
+# (an iOS Shortcut does this), and the hub hands it to the tool waiting here.
+
+PHONE = "phone"
+
+
+def notify_phone(req):
+    title = "Login for %s on %s" % (req["source"], socket.gethostname().split(".")[0])
+    message = "Tap to open. After the login, share the failed localhost page to the Shortcut."
+    headers = {
+        # HTTP headers must be latin-1; the source can contain "…".
+        "Title": title.encode("ascii", "replace").decode(),
+        "Click": req["url"],
+        "Tags": "key",
+    }
+    try:
+        post = urllib.request.Request(config["ntfy"], data=message.encode(), headers=headers)
+        urllib.request.urlopen(post, timeout=ACK_WAIT - 5).close()
+        ok, text = True, "sent to phone"
+    except (OSError, ValueError) as e:
+        ok, text = False, "phone notification failed: %s" % e
+    with cv:
+        if req["status"] in TERMINAL:
+            return
+        if not ok:
+            finish(req, "failed", text)
+            return
+        req["status"] = "opened"
+        log_event(req, text)
+        if not req["port"]:
+            finish(req, "done", "no redirect expected")
+        cv.notify_all()
+
+
+def connect_addr(bind_addr):
+    if bind_addr in ("0.0.0.0", ""):
+        return "127.0.0.1"
+    return "::1" if ":" in bind_addr else bind_addr
+
+
+def deliver_redirect(req, target):
+    """Send `GET target` to the tool's listener in one write and return its raw response."""
+    upstream = socket.create_connection((connect_addr(req["bind"]), req["port"]), timeout=10)
+    with upstream:
+        upstream.sendall(
+            (
+                "GET %s HTTP/1.1\r\nHost: localhost:%d\r\nConnection: close\r\n\r\n"
+                % (target, req["port"])
+            ).encode()
+        )
+        response = b""
+        try:
+            while True:
+                data = upstream.recv(65536)
+                if not data:
+                    break
+                response += data
+        except socket.timeout:
+            pass  # a listener that keeps the connection open has still answered
+        return response
 
 
 def watcher():
@@ -562,6 +643,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             )
         if path.path == "/api/status":
             return self.send(200, status_snapshot())
+        if path.path.startswith("/finish/"):
+            return self.finish_redirect()
         if path.path == "/api/agent/poll":
             return self.agent_poll(parse_qs(path.query))
         if path.path == "/api/agent/ping":
@@ -608,6 +691,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "error": req["events"][-1][1] if code >= 300 else None,
             }
         self.send(code, reply)
+
+    def finish_redirect(self):
+        """Phone: /finish/<port>/<path?query> delivers the redirect meant for localhost:<port>."""
+        m = re.match(r"/finish/(\d{2,5})(.*)$", self.path)
+        if not m:
+            return self.send(400, {"error": "expected /finish/<port>/..."})
+        port, target = int(m.group(1)), m.group(2)
+        if not target.startswith("/"):
+            target = "/" + target
+        with cv:
+            req = next(
+                (
+                    r
+                    for r in reversed(list(requests.values()))
+                    if r["agent"] == PHONE and r["port"] == port and r["status"] not in TERMINAL
+                ),
+                None,
+            )
+        if not req:
+            return self.send(404, {"error": "no phone login is waiting on port %d" % port})
+        mark_callback(req["id"], "redirect delivered from phone %s" % self.client_address[0])
+        try:
+            response = deliver_redirect(req, target)
+        except OSError as e:
+            return self.send(502, {"error": "tool on port %d unreachable: %s" % (port, e)})
+        if not response:
+            return self.send(502, {"error": "tool on port %d sent no response" % port})
+        self.close_connection = True
+        self.wfile.write(response)
 
     # --- status page actions
 

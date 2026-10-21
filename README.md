@@ -77,6 +77,26 @@ on the status page.
 Every agent appears on the status page. Requests go to the one marked **default**, or to the
 most recently active connected agent. `bb-open --agent <name> <url>` targets one explicitly.
 
+## Phone (iOS)
+
+A phone cannot run an agent: iOS suspends an app that waits on `localhost` as soon as you
+switch to the browser. Instead, the hub sends the URL to the phone as an
+[ntfy](https://ntfy.sh) push, and you give the redirect back to the hub by hand:
+
+1. Install the ntfy app on the phone and subscribe to a topic with a long random name.
+2. Add the topic to `~/.config/browser-bridge/hub.json` and restart the hub:
+   `"ntfy": "https://ntfy.sh/<topic>"`.
+3. In Shortcuts, make a share-sheet shortcut that accepts URLs and text (clipboard when there
+   is no input), replaces the regular expression `^https?://(localhost|127\.0\.0\.1):` with
+   `http://<hub>:7788/finish/`, and opens the result.
+
+When no agent is connected (or with `bb-open --agent phone`), requests go to the phone. Tap
+the notification and log in. The browser then fails to load `http://localhost:<port>/...`;
+share that page (or copy its address) to the shortcut. The hub delivers the redirect to the
+tool that waits for it. Only a login sent to the phone can be finished this way. The phone
+must be on the tailnet. The login URL goes through the ntfy server, so use a long topic name,
+or your own ntfy server.
+
 ## Security
 
 - Agents authenticate with the shared token in `~/.config/browser-bridge/token`.
