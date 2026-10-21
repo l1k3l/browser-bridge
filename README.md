@@ -29,7 +29,7 @@ If no agent is connected, `bb-open` exits non-zero and tools fall back to their 
 The hub serves a status page at `http://<server>:7788/` showing connected agents, a test
 button per agent, and the history of requests with a timeline for each.
 
-Python 3.8+ standard library only. Linux with systemd on both sides.
+Python 3.8+ standard library only. Linux (systemd) or macOS (launchd) on either side.
 
 ## Install the hub (server)
 
@@ -40,8 +40,8 @@ git clone <repo> ~/browser-bridge && cd ~/browser-bridge
 
 This creates `~/.config/browser-bridge/{token,hub.json}`, installs the
 `browser-bridge-hub` user service, and links `bb-open` into `~/.local/bin`. The hub listens on
-`127.0.0.1` and the Tailscale IP. Keep lingering on (`loginctl enable-linger`) so it runs
-without an open session.
+`127.0.0.1` and the Tailscale IP. On Linux, keep lingering on (`loginctl enable-linger`) so it
+runs without an open session. On macOS it is a LaunchAgent, so it runs while you are logged in.
 
 Then make tools use it:
 
@@ -69,7 +69,8 @@ on the status page.
 
 - `./install-agent.sh --reconfigure` picks a different browser profile.
 - `python3 bridge/agent.py profiles` lists the profiles it can see.
-- `journalctl --user -u browser-bridge-agent -f` shows the agent's log.
+- `journalctl --user -u browser-bridge-agent -f` (Linux) or
+  `tail -f ~/Library/Logs/browser-bridge-agent.log` (macOS) shows the agent's log.
 
 ## Several agents
 
@@ -111,7 +112,7 @@ process listens on, so it works when the port is not in the URL, as with Snowfla
 | `bridge/hub.py`, `bridge/status.html` | server |
 | `bin/bb-open`, `wrappers/snow` | server |
 | `bridge/agent.py` | desktop PC |
-| `install-hub.sh`, `install-agent.sh`, `systemd/` | installers and unit templates |
+| `install-hub.sh`, `install-agent.sh`, `systemd/`, `launchd/` | installers and service templates |
 
 State: `~/.config/browser-bridge/` (config, token), `~/.local/state/browser-bridge/`
 (hub history and default agent).

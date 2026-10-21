@@ -18,11 +18,14 @@ import os
 import re
 import secrets
 import socket
+import subprocess
+import sys
 import threading
 import time
 from urllib.parse import parse_qs, unquote, urlsplit
 
 VERSION = "0.1.0"
+MACOS = sys.platform == "darwin"
 CONFIG_DIR = os.path.expanduser("~/.config/browser-bridge")
 STATE_DIR = os.path.join(
     os.path.expanduser(os.environ.get("XDG_STATE_HOME", "~/.local/state")), "browser-bridge"
@@ -44,7 +47,8 @@ state = {"default_agent": None}
 config = {}
 
 
-# ---------------------------------------------------------------- /proc helpers
+# ---------------------------------------------------------------- process & socket helpers
+# Linux reads /proc; macOS asks lsof and ps.
 
 
 def _decode_addr(hexaddr):
@@ -73,6 +77,51 @@ def listening_sockets():
     return out
 
 
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def lsof_listeners(port=None, pid=None):
+    """[(addr, port)] of TCP sockets in LISTEN state, from lsof (macOS has no /proc)."""
+    cmd = [
+        "/usr/sbin/lsof",
+        "-nP",
+        "-a",
+        "-iTCP" + (":%d" % port if port else ""),
+        "-sTCP:LISTEN",
+        "-Ftn",
+    ]
+    if pid:
+        cmd += ["-p", str(pid)]
+    socks, ipv6 = [], False
+    for line in run(cmd).splitlines():
+        if line.startswith("t"):
+            ipv6 = line == "tIPv6"
+        elif line.startswith("n"):
+            addr, _, sock_port = line[1:].rpartition(":")
+            addr = addr.strip("[]")
+            if addr == "*":
+                addr = "::" if ipv6 else "0.0.0.0"
+            socks.append((addr, int(sock_port)))
+    return socks
+
+
+def all_listeners(port=None):
+    if MACOS:
+        return lsof_listeners(port=port)
+    return [s for s in listening_sockets().values() if port is None or s[1] == port]
+
+
+def pid_listeners(pid):
+    if MACOS:
+        return lsof_listeners(pid=pid)
+    listeners = listening_sockets()
+    return [listeners[i] for i in socket_inodes(pid) if i in listeners]
+
+
 def socket_inodes(pid):
     inodes = set()
     try:
@@ -90,6 +139,9 @@ def socket_inodes(pid):
 
 
 def parent_pid(pid):
+    if MACOS:
+        out = run(["/bin/ps", "-o", "ppid=", "-p", str(pid)]).strip()
+        return int(out) if out.isdigit() else 0
     try:
         with open("/proc/%d/stat" % pid) as f:
             return int(f.read().rsplit(")", 1)[1].split()[1])
@@ -97,13 +149,22 @@ def parent_pid(pid):
         return 0
 
 
-def describe_process(pid):
+def process_argv(pid):
+    if MACOS:
+        # ps joins argv with spaces, so arguments that contain spaces come back split.
+        return run(["/bin/ps", "-o", "args=", "-p", str(pid)]).split() or None
     try:
         with open("/proc/%d/cmdline" % pid, "rb") as f:
-            argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+            return [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
     except OSError:
         return None
-    if len(argv) > 1 and os.path.basename(argv[0]).startswith("python"):
+
+
+def describe_process(pid):
+    argv = process_argv(pid)
+    if argv is None:
+        return None
+    if len(argv) > 1 and os.path.basename(argv[0]).lower().startswith("python"):
         argv = argv[1:]
     if argv and os.path.basename(argv[0]) in ("sh", "bash", "zsh", "dash", "fish"):
         return os.path.basename(argv[0]) + " (shell)"
@@ -125,16 +186,15 @@ def port_from_url(url):
 
 def find_callback(url, pid, port=None):
     """(port, bind_addr) of the local listener waiting for the browser redirect, or (None, None)."""
-    listeners = listening_sockets()
     port = port or port_from_url(url)
     if port:
-        addrs = [a for a, p in listeners.values() if p == port]
+        addrs = [a for a, _ in all_listeners(port)]
         return port, (addrs[0] if addrs else "127.0.0.1")
     # Walk up from the requesting process: the tool itself, or the shell that ran xdg-open.
     for _ in range(3):
         if not pid or pid <= 1:
             break
-        mine = [listeners[i] for i in socket_inodes(pid) if i in listeners]
+        mine = pid_listeners(pid)
         if mine:
             addr, port = max(mine, key=lambda sock: sock[1])
             return port, addr
@@ -143,7 +203,7 @@ def find_callback(url, pid, port=None):
 
 
 def is_listening(addr, port):
-    return any(sock == (addr, port) for sock in listening_sockets().values())
+    return (addr, port) in all_listeners(port)
 
 
 # ---------------------------------------------------------------- TCP relay
