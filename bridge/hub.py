@@ -457,7 +457,9 @@ def notify_phone(req):
     }
     try:
         post = urllib.request.Request(config["ntfy"], data=message.encode(), headers=headers)
-        urllib.request.urlopen(post, timeout=ACK_WAIT - 5).close()
+        # Per socket operation, so the whole push can take a few times this: keep it well
+        # under ACK_WAIT, or the push arrives for a request that already failed.
+        urllib.request.urlopen(post, timeout=5).close()
         ok, text = True, "sent to phone"
     except (OSError, ValueError) as e:
         ok, text = False, "phone notification failed: %s" % e
@@ -488,7 +490,9 @@ def deliver_redirect(req, target):
             (
                 "GET %s HTTP/1.1\r\nHost: localhost:%d\r\nConnection: close\r\n\r\n"
                 % (target, req["port"])
-            ).encode()
+            ).encode(
+                "latin-1"
+            )  # http.server decoded the path as latin-1
         )
         response = b""
         try:
@@ -497,8 +501,8 @@ def deliver_redirect(req, target):
                 if not data:
                     break
                 response += data
-        except socket.timeout:
-            pass  # a listener that keeps the connection open has still answered
+        except OSError:
+            pass  # a timeout or reset after the answer still leaves a usable response
         return response
 
 
@@ -573,6 +577,7 @@ def start_test_listener(agent_name):
 def public_request(req):
     r = dict(req)
     r.pop("listener_gone", None)
+    r.pop("claimed", None)
     return r
 
 
@@ -694,7 +699,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def finish_redirect(self):
         """Phone: /finish/<port>/<path?query> delivers the redirect meant for localhost:<port>."""
-        m = re.match(r"/finish/(\d{2,5})(.*)$", self.path)
+        # Without this, any tailnet node (or a page open in a tailnet browser) could hand the
+        # waiting tool its own token.
+        phone_ip = config.get("phone_ip")
+        if phone_ip and self.client_address[0] != phone_ip:
+            return self.send(403, {"error": "only %s can finish phone logins" % phone_ip})
+        m = re.match(r"/finish/(\d{2,5})(?=[/?]|$)(.*)$", self.path)
         if not m:
             return self.send(400, {"error": "expected /finish/<port>/..."})
         port, target = int(m.group(1)), m.group(2)
@@ -705,19 +715,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 (
                     r
                     for r in reversed(list(requests.values()))
-                    if r["agent"] == PHONE and r["port"] == port and r["status"] not in TERMINAL
+                    if r["agent"] == PHONE
+                    and r["port"] == port
+                    and r["status"] == "opened"
+                    and not r.get("claimed")
                 ),
                 None,
             )
+            if req:
+                req["claimed"] = True  # one delivery per login
         if not req:
             return self.send(404, {"error": "no phone login is waiting on port %d" % port})
-        mark_callback(req["id"], "redirect delivered from phone %s" % self.client_address[0])
+        error = None
         try:
             response = deliver_redirect(req, target)
+            if not response:
+                error = "tool on port %d sent no response" % port
         except OSError as e:
-            return self.send(502, {"error": "tool on port %d unreachable: %s" % (port, e)})
-        if not response:
-            return self.send(502, {"error": "tool on port %d sent no response" % port})
+            error = "tool on port %d unreachable: %s" % (port, e)
+        if error:
+            with cv:
+                req["claimed"] = False
+                log_event(req, "phone redirect failed: %s" % error)
+            return self.send(502, {"error": error})
+        mark_callback(req["id"], "redirect delivered from phone %s" % self.client_address[0])
         self.close_connection = True
         self.wfile.write(response)
 

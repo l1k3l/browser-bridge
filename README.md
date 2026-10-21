@@ -84,18 +84,24 @@ switch to the browser. Instead, the hub sends the URL to the phone as an
 [ntfy](https://ntfy.sh) push, and you give the redirect back to the hub by hand:
 
 1. Install the ntfy app on the phone and subscribe to a topic with a long random name.
-2. Add the topic to `~/.config/browser-bridge/hub.json` and restart the hub:
-   `"ntfy": "https://ntfy.sh/<topic>"`.
+2. Add the topic and the phone's Tailscale IP to `~/.config/browser-bridge/hub.json` and
+   restart the hub: `"ntfy": "https://ntfy.sh/<topic>", "phone_ip": "100.x.y.z"`. Without
+   `phone_ip`, any tailnet node can finish a phone login with a token of its own.
 3. In Shortcuts, make a share-sheet shortcut that accepts URLs and text (clipboard when there
    is no input), replaces the regular expression `^https?://(localhost|127\.0\.0\.1):` with
    `http://<hub>:7788/finish/`, and opens the result.
 
-When no agent is connected (or with `bb-open --agent phone`), requests go to the phone. Tap
+When no agent is connected, requests go to the phone. `bb-open --agent phone`, or
+`BROWSER_BRIDGE_AGENT=phone` for tools that run `$BROWSER`, sends them there anyway. Tap
 the notification and log in. The browser then fails to load `http://localhost:<port>/...`;
 share that page (or copy its address) to the shortcut. The hub delivers the redirect to the
-tool that waits for it. Only a login sent to the phone can be finished this way. The phone
-must be on the tailnet. The login URL goes through the ntfy server, so use a long topic name,
-or your own ntfy server.
+tool that waits for it. Only a login sent to the phone can be finished this way, and only
+once. The phone must be on the tailnet.
+
+With `ntfy` set, `bb-open` no longer fails when no agent is connected, so tools do not fall
+back to printing the URL: every `$BROWSER` URL goes to the phone. The URLs go through the ntfy
+server, and anyone who knows the topic can send you notifications. Use a long topic name, or
+your own ntfy server.
 
 ## Security
 
