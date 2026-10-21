@@ -365,7 +365,8 @@ def cmd_configure(args):
             if choice.isdigit() and 0 <= int(choice) <= len(profiles):
                 break
         if choice == "0":
-            cfg.pop("browser", None)
+            # null, not absent: --keep-browser keeps the choice instead of asking again.
+            cfg["browser"] = None
             cfg.pop("browser_label", None)
         else:
             p = profiles[int(choice) - 1]
